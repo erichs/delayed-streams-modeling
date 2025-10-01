@@ -5,10 +5,15 @@
 use anyhow::Result;
 use candle::{Device, Tensor};
 use clap::Parser;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// The audio input file, in wav/mp3/ogg/... format.
+    /// The audio input file, in wav/mp3/ogg/... format. Use "--mic" to capture from microphone.
+    #[arg(default_value = "--mic")]
     in_file: String,
 
     /// The repo where to get the model from.
@@ -30,6 +35,27 @@ struct Args {
     /// Display the level of voice activity detection (VAD).
     #[arg(long)]
     vad: bool,
+
+    /// Use microphone input instead of file.
+    #[arg(long)]
+    mic: bool,
+
+    /// List available audio input devices.
+    #[arg(long)]
+    list_devices: bool,
+
+    /// Duration in seconds to record from microphone (default: continuous until Ctrl+C).
+    #[arg(long)]
+    duration: Option<f32>,
+
+    /// Output file path to append transcript to (optional).
+    #[arg(long)]
+    output: Option<String>,
+
+    /// Audio gain/sensitivity multiplier (1.0 = normal, 2.0 = double volume, etc.).
+    /// Useful for picking up softer speech. Recommended range: 1.0-5.0.
+    #[arg(long, default_value = "1.0")]
+    gain: f32,
 }
 
 fn device(cpu: bool) -> Result<Device> {
@@ -169,9 +195,7 @@ impl Model {
         })
     }
 
-    fn run(&mut self, mut pcm: Vec<f32>) -> Result<()> {
-        use std::io::Write;
-
+    fn run(&mut self, mut pcm: Vec<f32>, output_file: Option<String>) -> Result<()> {
         // Add the silence prefix to the audio.
         if self.config.stt_config.audio_silence_prefix_seconds > 0.0 {
             let silence_len =
@@ -182,23 +206,115 @@ impl Model {
         let suffix = (self.config.stt_config.audio_delay_seconds * 24000.0) as usize;
         pcm.resize(pcm.len() + suffix + 24000, 0.0);
 
-        let mut last_word = None;
-        let mut printed_eot = false;
-        for pcm in pcm.chunks(1920) {
-            let pcm = Tensor::new(pcm, &self.dev)?.reshape((1, 1, ()))?;
+        self.process_audio_chunks(&pcm, output_file)?;
+        Ok(())
+    }
+
+    fn run_streaming(&mut self, audio_receiver: Receiver<Vec<f32>>, output_file: Option<String>) -> Result<()> {
+        println!("Starting real-time transcription from microphone...");
+        println!("Speak now - transcription will appear as you talk.");
+        println!("Press Ctrl+C to stop.");
+        if let Some(ref path) = output_file {
+            println!("Transcript will be appended to: {}", path);
+        }
+        println!();
+
+        let mut last_print_was_vad = false;
+        let mut file_handle = if let Some(ref path) = output_file {
+            Some(OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?)
+        } else {
+            None
+        };
+
+        loop {
+            // Receive audio chunk from microphone (blocking)
+            let chunk = match audio_receiver.recv() {
+                Ok(chunk) => chunk,
+                Err(_) => break, // Channel closed, microphone stopped
+            };
+
+            // Process the chunk through the model
+            let pcm = Tensor::new(&chunk[..], &self.dev)?.reshape((1, 1, ()))?;
             let asr_msgs = self.state.step_pcm(pcm, None, &().into(), |_, _, _| ())?;
+
             for asr_msg in asr_msgs.iter() {
                 match asr_msg {
                     moshi::asr::AsrMsg::Step { prs, .. } => {
-                        // prs is the probability of having no voice activity for different time
-                        // horizons.
-                        // In kyutai/stt-1b-en_fr-candle, these horizons are 0.5s, 1s, 2s, and 3s.
+                        if self.vad && prs[2][0] > 0.5 && !last_print_was_vad {
+                            let msg = " [end of turn detected]";
+                            print!("{}", msg);
+                            std::io::stdout().flush()?;
+                            if let Some(ref mut file) = file_handle {
+                                write!(file, "{}", msg)?;
+                                file.flush()?;
+                            }
+                            last_print_was_vad = true;
+                        }
+                    }
+                    moshi::asr::AsrMsg::Word { tokens, .. } => {
+                        let word = self
+                            .text_tokenizer
+                            .decode_piece_ids(tokens)
+                            .unwrap_or_else(|_| String::new());
+                        // Add space before word for proper spacing
+                        let output = format!(" {}", word);
+                        print!("{}", output);
+                        std::io::stdout().flush()?;
+                        if let Some(ref mut file) = file_handle {
+                            write!(file, "{}", output)?;
+                            file.flush()?;
+                        }
+                        last_print_was_vad = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        println!();
+        if let Some(ref mut file) = file_handle {
+            writeln!(file)?;
+            file.flush()?;
+        }
+        println!("Transcription stopped.");
+        Ok(())
+    }
+
+    fn process_audio_chunks(&mut self, pcm: &[f32], output_file: Option<String>) -> Result<()> {
+        let mut file_handle = if let Some(ref path) = output_file {
+            Some(OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?)
+        } else {
+            None
+        };
+
+        let mut last_word = None;
+        let mut printed_eot = false;
+        for pcm_chunk in pcm.chunks(1920) {
+            let pcm_tensor = Tensor::new(pcm_chunk, &self.dev)?.reshape((1, 1, ()))?;
+            let asr_msgs = self.state.step_pcm(pcm_tensor, None, &().into(), |_, _, _| ())?;
+            for asr_msg in asr_msgs.iter() {
+                match asr_msg {
+                    moshi::asr::AsrMsg::Step { prs, .. } => {
                         if self.vad && prs[2][0] > 0.5 && !printed_eot {
                             printed_eot = true;
                             if !self.timestamps {
-                                print!(" <endofturn pr={}>", prs[2][0]);
+                                let msg = format!(" <endofturn pr={}>", prs[2][0]);
+                                print!("{}", msg);
+                                if let Some(ref mut file) = file_handle {
+                                    write!(file, "{}", msg)?;
+                                }
                             } else {
-                                println!("<endofturn pr={}>", prs[2][0]);
+                                let msg = format!("<endofturn pr={}>\n", prs[2][0]);
+                                print!("{}", msg);
+                                if let Some(ref mut file) = file_handle {
+                                    write!(file, "{}", msg)?;
+                                }
                             }
                         }
                     }
@@ -207,7 +323,11 @@ impl Model {
                         #[allow(clippy::collapsible_if)]
                         if self.timestamps {
                             if let Some((word, start_time)) = last_word.take() {
-                                println!("[{start_time:5.2}-{stop_time:5.2}] {word}");
+                                let msg = format!("[{start_time:5.2}-{stop_time:5.2}] {word}\n");
+                                print!("{}", msg);
+                                if let Some(ref mut file) = file_handle {
+                                    write!(file, "{}", msg)?;
+                                }
                             }
                         }
                     }
@@ -220,11 +340,19 @@ impl Model {
                             .decode_piece_ids(tokens)
                             .unwrap_or_else(|_| String::new());
                         if !self.timestamps {
-                            print!(" {word}");
-                            std::io::stdout().flush()?
+                            let output = format!(" {}", word);
+                            print!("{}", output);
+                            std::io::stdout().flush()?;
+                            if let Some(ref mut file) = file_handle {
+                                write!(file, "{}", output)?;
+                            }
                         } else {
                             if let Some((word, prev_start_time)) = last_word.take() {
-                                println!("[{prev_start_time:5.2}-{start_time:5.2}] {word}");
+                                let msg = format!("[{prev_start_time:5.2}-{start_time:5.2}] {word}\n");
+                                print!("{}", msg);
+                                if let Some(ref mut file) = file_handle {
+                                    write!(file, "{}", msg)?;
+                                }
                             }
                             last_word = Some((word, *start_time));
                         }
@@ -233,28 +361,336 @@ impl Model {
             }
         }
         if let Some((word, start_time)) = last_word.take() {
-            println!("[{start_time:5.2}-     ] {word}");
+            let msg = format!("[{start_time:5.2}-     ] {word}\n");
+            print!("{}", msg);
+            if let Some(ref mut file) = file_handle {
+                write!(file, "{}", msg)?;
+            }
         }
         println!();
+        if let Some(ref mut file) = file_handle {
+            file.flush()?;
+        }
         Ok(())
+    }
+}
+
+fn list_audio_devices() -> Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    println!("Available audio input devices:");
+    println!();
+
+    for (idx, device) in host.input_devices()?.enumerate() {
+        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+        println!("  [{}] {}", idx, name);
+
+        if let Ok(config) = device.default_input_config() {
+            println!("      Sample rate: {} Hz", config.sample_rate().0);
+            println!("      Channels: {}", config.channels());
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
+
+    let host = cpal::default_host();
+    let device = host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+
+    println!("Using input device: {}", device.name()?);
+
+    let config = device.default_input_config()?;
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+
+    println!("Recording at {} Hz with {} channel(s)", sample_rate, channels);
+    if gain != 1.0 {
+        println!("Audio gain: {:.1}x", gain);
+    }
+
+    // We need to resample if not 24kHz
+    let needs_resampling = sample_rate != 24000;
+    if needs_resampling {
+        println!("Will resample from {} Hz to 24000 Hz", sample_rate);
+    }
+
+    let chunk_size = 1920; // 80ms at 24kHz
+    let input_chunk_size = if needs_resampling {
+        (chunk_size as f32 * sample_rate as f32 / 24000.0) as usize
+    } else {
+        chunk_size
+    };
+
+    let audio_buffer = Arc::new(Mutex::new(Vec::new()));
+    let audio_buffer_clone = audio_buffer.clone();
+
+    let err_fn = |err| eprintln!("Error in audio stream: {}", err);
+
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    // Convert to mono if needed and apply gain
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| s * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push(chunk[0] * gain); // Take first channel and apply gain
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| (s as f32 / 32768.0) * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push((chunk[0] as f32 / 32768.0) * gain);
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| ((s as f32 - 32768.0) / 32768.0) * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push(((chunk[0] as f32 - 32768.0) / 32768.0) * gain);
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+    };
+
+    stream.play()?;
+
+    // Process audio chunks and send them for inference
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let chunk = {
+            let mut buffer = audio_buffer.lock().unwrap();
+            if buffer.len() >= input_chunk_size {
+                let chunk: Vec<f32> = buffer.drain(..input_chunk_size).collect();
+                chunk
+            } else {
+                continue;
+            }
+        };
+
+        // Resample if needed
+        let chunk = if needs_resampling {
+            kaudio::resample(&chunk, sample_rate as usize, 24000)?
+        } else {
+            chunk
+        };
+
+        // Send chunk for processing
+        if sender.send(chunk).is_err() {
+            break; // Receiver dropped, stop streaming
+        }
+    }
+
+    Ok(())
+}
+
+fn capture_from_microphone(duration: Option<f32>, gain: f32) -> Result<Vec<f32>> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
+
+    let host = cpal::default_host();
+    let device = host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+
+    println!("Using input device: {}", device.name()?);
+
+    let config = device.default_input_config()?;
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+
+    println!("Recording at {} Hz with {} channel(s)", sample_rate, channels);
+    if gain != 1.0 {
+        println!("Audio gain: {:.1}x", gain);
+    }
+
+    let audio_buffer = Arc::new(Mutex::new(Vec::new()));
+    let audio_buffer_clone = audio_buffer.clone();
+
+    let err_fn = |err| eprintln!("Error in audio stream: {}", err);
+
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| s * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push(chunk[0] * gain);
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| (s as f32 / 32768.0) * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push((chunk[0] as f32 / 32768.0) * gain);
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let mut buffer = audio_buffer_clone.lock().unwrap();
+                    if channels == 1 {
+                        buffer.extend(data.iter().map(|&s| ((s as f32 - 32768.0) / 32768.0) * gain));
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            buffer.push(((chunk[0] as f32 - 32768.0) / 32768.0) * gain);
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+    };
+
+    stream.play()?;
+
+    if let Some(dur) = duration {
+        println!("Recording for {} seconds...", dur);
+        std::thread::sleep(std::time::Duration::from_secs_f32(dur));
+    } else {
+        println!("Recording... Press Ctrl+C to stop.");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    drop(stream);
+
+    let pcm = audio_buffer.lock().unwrap().clone();
+
+    if sample_rate != 24000 {
+        println!("Resampling from {} Hz to 24000 Hz...", sample_rate);
+        Ok(kaudio::resample(&pcm, sample_rate as usize, 24000)?)
+    } else {
+        Ok(pcm)
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.list_devices {
+        return list_audio_devices();
+    }
+
     let device = device(args.cpu)?;
     println!("Using device: {:?}", device);
 
-    println!("Loading audio file from: {}", args.in_file);
-    let (pcm, sample_rate) = kaudio::pcm_decode(&args.in_file)?;
-    let pcm = if sample_rate != 24_000 {
-        kaudio::resample(&pcm, sample_rate as usize, 24_000)?
-    } else {
-        pcm
-    };
+    // Load the model FIRST before capturing any audio
     println!("Loading model from repository: {}", args.hf_repo);
+    println!("(This may take a few minutes on first run while downloading model files...)");
     let mut model = Model::load_from_hf(&args, &device)?;
-    println!("Running inference");
-    model.run(pcm)?;
+    println!("Model loaded successfully!");
+    println!();
+
+    let use_mic = args.mic || args.in_file == "--mic";
+
+    if use_mic {
+        // Validate gain parameter
+        if args.gain <= 0.0 {
+            return Err(anyhow::anyhow!("Gain must be positive (got {})", args.gain));
+        }
+        if args.gain > 10.0 {
+            println!("Warning: Gain of {:.1}x is very high and may cause distortion", args.gain);
+        }
+
+        // Use streaming mode for microphone input
+        if args.duration.is_some() {
+            // For fixed duration, use batch mode
+            let pcm = capture_from_microphone(args.duration, args.gain)?;
+            println!("Running inference");
+            if let Some(ref path) = args.output {
+                println!("Transcript will be appended to: {}", path);
+            }
+            model.run(pcm, args.output)?;
+        } else {
+            // For continuous recording, use streaming mode
+            let (sender, receiver) = mpsc::channel();
+            let gain = args.gain;
+
+            // Spawn microphone capture thread
+            std::thread::spawn(move || {
+                if let Err(e) = stream_from_microphone(sender, gain) {
+                    eprintln!("Microphone error: {}", e);
+                }
+            });
+
+            // Run streaming inference on main thread
+            model.run_streaming(receiver, args.output)?;
+        }
+    } else {
+        // File input - use batch mode
+        println!("Loading audio file from: {}", args.in_file);
+        let (pcm, sample_rate) = kaudio::pcm_decode(&args.in_file)?;
+        let pcm = if sample_rate != 24_000 {
+            kaudio::resample(&pcm, sample_rate as usize, 24_000)?
+        } else {
+            pcm
+        };
+        println!("Running inference");
+        if let Some(ref path) = args.output {
+            println!("Transcript will be appended to: {}", path);
+        }
+        model.run(pcm, args.output)?;
+    }
+
     Ok(())
 }
