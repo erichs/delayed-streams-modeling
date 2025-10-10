@@ -5,10 +5,75 @@
 use anyhow::Result;
 use candle::{Device, Tensor};
 use clap::Parser;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+/// Buffered file writer that flushes based on size or time thresholds.
+/// This ensures that file watchers can see updates without excessive delay.
+/// Closes and reopens the file on each flush to reliably trigger file system events.
+struct BufferedFileWriter {
+    file: File,
+    path: String,
+    bytes_written: usize,
+    last_flush: Instant,
+    flush_size_threshold: usize,
+    flush_time_threshold: Duration,
+}
+
+impl BufferedFileWriter {
+    fn new(file: File, path: String) -> Self {
+        Self {
+            file,
+            path,
+            bytes_written: 0,
+            last_flush: Instant::now(),
+            flush_size_threshold: 200,  // 200 bytes
+            flush_time_threshold: Duration::from_secs(2),  // 2 seconds
+        }
+    }
+
+    fn write(&mut self, data: &str) -> Result<()> {
+        self.file.write_all(data.as_bytes())?;
+        self.bytes_written += data.len();
+
+        // Check if we should flush
+        let should_flush = self.bytes_written >= self.flush_size_threshold
+            || self.last_flush.elapsed() >= self.flush_time_threshold;
+
+        if should_flush {
+            self.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Flush and sync to disk
+        self.file.flush()?;
+        self.file.sync_all()?;
+
+        // Close and reopen the file to trigger file system events
+        // This is necessary for file watchers (like chokidar with fsevents) to detect changes
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+
+        self.bytes_written = 0;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+}
+
+impl Drop for BufferedFileWriter {
+    fn drop(&mut self) {
+        // Ensure final flush on drop
+        let _ = self.flush();
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -216,15 +281,17 @@ impl Model {
         println!("Press Ctrl+C to stop.");
         if let Some(ref path) = output_file {
             println!("Transcript will be appended to: {}", path);
+            println!("(File will be synced every 200 bytes or 2 seconds for file watchers)");
         }
         println!();
 
         let mut last_print_was_vad = false;
-        let mut file_handle = if let Some(ref path) = output_file {
-            Some(OpenOptions::new()
+        let mut file_writer = if let Some(ref path) = output_file {
+            let file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)?)
+                .open(path)?;
+            Some(BufferedFileWriter::new(file, path.clone()))
         } else {
             None
         };
@@ -247,9 +314,8 @@ impl Model {
                             let msg = " [end of turn detected]";
                             print!("{}", msg);
                             std::io::stdout().flush()?;
-                            if let Some(ref mut file) = file_handle {
-                                write!(file, "{}", msg)?;
-                                file.flush()?;
+                            if let Some(ref mut writer) = file_writer {
+                                writer.write(msg)?;
                             }
                             last_print_was_vad = true;
                         }
@@ -263,9 +329,8 @@ impl Model {
                         let output = format!(" {}", word);
                         print!("{}", output);
                         std::io::stdout().flush()?;
-                        if let Some(ref mut file) = file_handle {
-                            write!(file, "{}", output)?;
-                            file.flush()?;
+                        if let Some(ref mut writer) = file_writer {
+                            writer.write(&output)?;
                         }
                         last_print_was_vad = false;
                     }
@@ -275,20 +340,21 @@ impl Model {
         }
 
         println!();
-        if let Some(ref mut file) = file_handle {
-            writeln!(file)?;
-            file.flush()?;
+        if let Some(ref mut writer) = file_writer {
+            writer.write("\n")?;
+            writer.flush()?;
         }
         println!("Transcription stopped.");
         Ok(())
     }
 
     fn process_audio_chunks(&mut self, pcm: &[f32], output_file: Option<String>) -> Result<()> {
-        let mut file_handle = if let Some(ref path) = output_file {
-            Some(OpenOptions::new()
+        let mut file_writer = if let Some(ref path) = output_file {
+            let file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)?)
+                .open(path)?;
+            Some(BufferedFileWriter::new(file, path.clone()))
         } else {
             None
         };
@@ -306,14 +372,14 @@ impl Model {
                             if !self.timestamps {
                                 let msg = format!(" <endofturn pr={}>", prs[2][0]);
                                 print!("{}", msg);
-                                if let Some(ref mut file) = file_handle {
-                                    write!(file, "{}", msg)?;
+                                if let Some(ref mut writer) = file_writer {
+                                    writer.write(&msg)?;
                                 }
                             } else {
                                 let msg = format!("<endofturn pr={}>\n", prs[2][0]);
                                 print!("{}", msg);
-                                if let Some(ref mut file) = file_handle {
-                                    write!(file, "{}", msg)?;
+                                if let Some(ref mut writer) = file_writer {
+                                    writer.write(&msg)?;
                                 }
                             }
                         }
@@ -325,8 +391,8 @@ impl Model {
                             if let Some((word, start_time)) = last_word.take() {
                                 let msg = format!("[{start_time:5.2}-{stop_time:5.2}] {word}\n");
                                 print!("{}", msg);
-                                if let Some(ref mut file) = file_handle {
-                                    write!(file, "{}", msg)?;
+                                if let Some(ref mut writer) = file_writer {
+                                    writer.write(&msg)?;
                                 }
                             }
                         }
@@ -343,15 +409,15 @@ impl Model {
                             let output = format!(" {}", word);
                             print!("{}", output);
                             std::io::stdout().flush()?;
-                            if let Some(ref mut file) = file_handle {
-                                write!(file, "{}", output)?;
+                            if let Some(ref mut writer) = file_writer {
+                                writer.write(&output)?;
                             }
                         } else {
                             if let Some((word, prev_start_time)) = last_word.take() {
                                 let msg = format!("[{prev_start_time:5.2}-{start_time:5.2}] {word}\n");
                                 print!("{}", msg);
-                                if let Some(ref mut file) = file_handle {
-                                    write!(file, "{}", msg)?;
+                                if let Some(ref mut writer) = file_writer {
+                                    writer.write(&msg)?;
                                 }
                             }
                             last_word = Some((word, *start_time));
@@ -363,13 +429,13 @@ impl Model {
         if let Some((word, start_time)) = last_word.take() {
             let msg = format!("[{start_time:5.2}-     ] {word}\n");
             print!("{}", msg);
-            if let Some(ref mut file) = file_handle {
-                write!(file, "{}", msg)?;
+            if let Some(ref mut writer) = file_writer {
+                writer.write(&msg)?;
             }
         }
         println!();
-        if let Some(ref mut file) = file_handle {
-            file.flush()?;
+        if let Some(ref mut writer) = file_writer {
+            writer.flush()?;
         }
         Ok(())
     }
