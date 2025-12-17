@@ -8,7 +8,8 @@ use clap::Parser;
 use std::fs::{File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 /// Buffered file writer that flushes based on size or time thresholds.
@@ -121,6 +122,10 @@ struct Args {
     /// Useful for picking up softer speech. Recommended range: 1.0-5.0.
     #[arg(long, default_value = "1.0")]
     gain: f32,
+
+    /// Enable verbose debug output (buffer status, timing, chunk info).
+    #[arg(long)]
+    debug: bool,
 }
 
 fn device(cpu: bool) -> Result<Device> {
@@ -275,7 +280,7 @@ impl Model {
         Ok(())
     }
 
-    fn run_streaming(&mut self, audio_receiver: Receiver<Vec<f32>>, output_file: Option<String>) -> Result<()> {
+    fn run_streaming(&mut self, audio_receiver: Receiver<Vec<f32>>, pending_chunks: Arc<AtomicU64>, output_file: Option<String>, debug: bool) -> Result<()> {
         println!("Starting real-time transcription from microphone...");
         println!("Speak now - transcription will appear as you talk.");
         println!("Press Ctrl+C to stop.");
@@ -284,7 +289,9 @@ impl Model {
             println!("(File will be synced every 200 bytes or 2 seconds for file watchers)");
         }
         println!();
-        println!("[DEBUG] Streaming mode initialized");
+        if debug {
+            eprintln!("[DEBUG] Streaming mode initialized");
+        }
 
         let mut last_print_was_vad = false;
         let mut file_writer = if let Some(ref path) = output_file {
@@ -302,54 +309,91 @@ impl Model {
         let mut last_status_time = Instant::now();
         let status_interval = Duration::from_secs(5);
 
+        // Transcript loss detection
+        let mut last_transcript_time = Instant::now();
+        let mut chunks_since_transcript = 0u64;
+        let mut loss_alert_printed = false;
+        let transcript_timeout = Duration::from_secs(10); // Alert after 10s without transcript
+        let recv_timeout = Duration::from_secs(2); // Detect stalled audio after 2s
+
         loop {
-            // Receive audio chunk from microphone (blocking)
+            // Receive audio chunk from microphone (with timeout to detect stalls)
             let recv_start = Instant::now();
-            let chunk = match audio_receiver.recv() {
+            let chunk = match audio_receiver.recv_timeout(recv_timeout) {
                 Ok(chunk) => {
+                    // Decrement pending counter - we received this chunk
+                    pending_chunks.fetch_sub(1, Ordering::Relaxed);
                     let recv_duration = recv_start.elapsed();
-                    if recv_duration > Duration::from_millis(100) {
+                    if debug && recv_duration > Duration::from_millis(100) {
                         eprintln!("[DEBUG] Long wait for audio chunk: {:?}", recv_duration);
                     }
                     chunk
                 },
-                Err(_) => {
-                    eprintln!("[DEBUG] Audio channel closed, stopping transcription");
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("[WARNING] No audio received for {:?} - audio stream may be stalled!", recv_timeout);
+                    // Print LOS indicator for timeout
+                    let msg = " [LOS:audio_timeout]";
+                    print!("{}", msg);
+                    std::io::stdout().flush()?;
+                    if let Some(ref mut writer) = file_writer {
+                        writer.write(msg)?;
+                    }
+                    continue; // Keep trying
+                },
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if debug {
+                        eprintln!("[DEBUG] Audio channel closed, stopping transcription");
+                    }
                     break;
                 }
             };
 
             chunk_count += 1;
             total_samples += chunk.len();
+            chunks_since_transcript += 1;
             let chunk_duration_ms = (chunk.len() as f32 / 24000.0) * 1000.0;
 
-            eprintln!("[DEBUG] Chunk #{}: {} samples ({:.1}ms of audio)",
-                     chunk_count, chunk.len(), chunk_duration_ms);
+            if debug {
+                eprintln!("[DEBUG] Chunk #{}: {} samples ({:.1}ms of audio)",
+                         chunk_count, chunk.len(), chunk_duration_ms);
+            }
 
             // Process the chunk through the model
-            let tensor_start = Instant::now();
             let pcm = Tensor::new(&chunk[..], &self.dev)?.reshape((1, 1, ()))?;
-            let tensor_duration = tensor_start.elapsed();
-
-            if tensor_duration > Duration::from_millis(10) {
-                eprintln!("[DEBUG] Tensor creation took: {:?}", tensor_duration);
-            }
 
             let inference_start = Instant::now();
             let asr_msgs = self.state.step_pcm(pcm, None, &().into(), |_, _, _| ())?;
             let inference_duration = inference_start.elapsed();
 
-            eprintln!("[DEBUG] Inference took: {:?}, produced {} messages",
-                     inference_duration, asr_msgs.len());
+            if debug {
+                eprintln!("[DEBUG] Inference took: {:?}, produced {} messages",
+                         inference_duration, asr_msgs.len());
+            }
 
             if inference_duration > Duration::from_millis(200) {
                 eprintln!("[WARNING] Slow inference detected: {:?}", inference_duration);
             }
 
+            // Check for transcript loss (many chunks processed without any transcript output)
+            let time_since_transcript = last_transcript_time.elapsed();
+            if time_since_transcript > transcript_timeout && !loss_alert_printed {
+                eprintln!("[WARNING] TRANSCRIPT LOSS DETECTED: {} chunks ({:.1}s) without transcript output!",
+                         chunks_since_transcript, time_since_transcript.as_secs_f32());
+                let msg = format!(" [LOS:no_transcript_{}s]", time_since_transcript.as_secs());
+                print!("{}", msg);
+                std::io::stdout().flush()?;
+                if let Some(ref mut writer) = file_writer {
+                    writer.write(&msg)?;
+                }
+                loss_alert_printed = true;
+            }
+
             for asr_msg in asr_msgs.iter() {
                 match asr_msg {
                     moshi::asr::AsrMsg::Step { prs, .. } => {
-                        eprintln!("[DEBUG] Step message - VAD scores: {:?}", &prs[2][0..3.min(prs[2].len())]);
+                        if debug {
+                            eprintln!("[DEBUG] Step message - VAD scores: {:?}", &prs[2][0..3.min(prs[2].len())]);
+                        }
                         if self.vad && prs[2][0] > 0.5 && !last_print_was_vad {
                             let msg = " [end of turn detected]";
                             print!("{}", msg);
@@ -358,15 +402,34 @@ impl Model {
                                 writer.write(msg)?;
                             }
                             last_print_was_vad = true;
-                            eprintln!("[DEBUG] End of turn detected");
+                            if debug {
+                                eprintln!("[DEBUG] End of turn detected");
+                            }
                         }
                     }
                     moshi::asr::AsrMsg::Word { tokens, .. } => {
-                        eprintln!("[DEBUG] Word message - {} tokens", tokens.len());
+                        if debug {
+                            eprintln!("[DEBUG] Word message - {} tokens", tokens.len());
+                        }
                         let word = self
                             .text_tokenizer
                             .decode_piece_ids(tokens)
                             .unwrap_or_else(|_| String::new());
+
+                        // Reset transcript loss tracking - we got output!
+                        if loss_alert_printed {
+                            eprintln!("[INFO] Transcript resumed after {:.1}s gap", time_since_transcript.as_secs_f32());
+                            let msg = " [RESUMED]";
+                            print!("{}", msg);
+                            std::io::stdout().flush()?;
+                            if let Some(ref mut writer) = file_writer {
+                                writer.write(msg)?;
+                            }
+                        }
+                        last_transcript_time = Instant::now();
+                        chunks_since_transcript = 0;
+                        loss_alert_printed = false;
+
                         // Add space before word for proper spacing
                         let output = format!(" {}", word);
                         print!("{}", output);
@@ -375,19 +438,23 @@ impl Model {
                             writer.write(&output)?;
                         }
                         last_print_was_vad = false;
-                        eprintln!("[DEBUG] Transcribed word: '{}'", word);
+                        if debug {
+                            eprintln!("[DEBUG] Transcribed word: '{}'", word);
+                        }
                     }
                     _ => {
-                        eprintln!("[DEBUG] Other ASR message type");
+                        if debug {
+                            eprintln!("[DEBUG] Other ASR message type");
+                        }
                     }
                 }
             }
 
-            // Periodic status update
-            if last_status_time.elapsed() >= status_interval {
+            // Periodic status update (only in debug mode)
+            if debug && last_status_time.elapsed() >= status_interval {
                 let total_audio_seconds = total_samples as f32 / 24000.0;
-                eprintln!("[STATUS] Processed {} chunks, {:.1}s of audio total",
-                         chunk_count, total_audio_seconds);
+                eprintln!("[STATUS] Processed {} chunks, {:.1}s of audio total, {} chunks since last transcript",
+                         chunk_count, total_audio_seconds, chunks_since_transcript);
                 last_status_time = Instant::now();
             }
         }
@@ -397,7 +464,9 @@ impl Model {
             writer.write("\n")?;
             writer.flush()?;
         }
-        eprintln!("[DEBUG] Transcription stopped. Total chunks processed: {}", chunk_count);
+        if debug {
+            eprintln!("[DEBUG] Transcription stopped. Total chunks processed: {}", chunk_count);
+        }
         println!("Transcription stopped.");
         Ok(())
     }
@@ -516,7 +585,7 @@ fn list_audio_devices() -> Result<()> {
     Ok(())
 }
 
-fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
+fn stream_from_microphone(sender: SyncSender<Vec<f32>>, pending_chunks: Arc<AtomicU64>, gain: f32, debug: bool) -> Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::SampleFormat;
 
@@ -548,32 +617,23 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
         chunk_size
     };
 
-    eprintln!("[DEBUG] Microphone streaming config:");
-    eprintln!("[DEBUG]   Target chunk size: {} samples (80ms at 24kHz)", chunk_size);
-    eprintln!("[DEBUG]   Input chunk size: {} samples", input_chunk_size);
-    eprintln!("[DEBUG]   Needs resampling: {}", needs_resampling);
+    if debug {
+        eprintln!("[DEBUG] Microphone streaming config:");
+        eprintln!("[DEBUG]   Target chunk size: {} samples (80ms at 24kHz)", chunk_size);
+        eprintln!("[DEBUG]   Input chunk size: {} samples", input_chunk_size);
+        eprintln!("[DEBUG]   Needs resampling: {}", needs_resampling);
+    }
 
     let audio_buffer = Arc::new(Mutex::new(Vec::new()));
     let audio_buffer_clone = audio_buffer.clone();
-
-    let callback_count = Arc::new(Mutex::new(0u64));
-    let callback_count_clone = callback_count.clone();
 
     let err_fn = |err| eprintln!("[ERROR] Error in audio stream: {}", err);
 
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
-            let callback_count_f32 = callback_count_clone.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut count = callback_count_f32.lock().unwrap();
-                    *count += 1;
-                    if *count % 100 == 0 {
-                        eprintln!("[DEBUG] Audio callback #{}, received {} samples", count, data.len());
-                    }
-                    drop(count);
-
                     let mut buffer = audio_buffer_clone.lock().unwrap();
                     // Convert to mono if needed and apply gain
                     if channels == 1 {
@@ -589,17 +649,9 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
             )?
         }
         SampleFormat::I16 => {
-            let callback_count_i16 = callback_count_clone.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let mut count = callback_count_i16.lock().unwrap();
-                    *count += 1;
-                    if *count % 100 == 0 {
-                        eprintln!("[DEBUG] Audio callback #{}, received {} samples", count, data.len());
-                    }
-                    drop(count);
-
                     let mut buffer = audio_buffer_clone.lock().unwrap();
                     if channels == 1 {
                         buffer.extend(data.iter().map(|&s| (s as f32 / 32768.0) * gain));
@@ -614,17 +666,9 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
             )?
         }
         SampleFormat::U16 => {
-            let callback_count_u16 = callback_count_clone.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let mut count = callback_count_u16.lock().unwrap();
-                    *count += 1;
-                    if *count % 100 == 0 {
-                        eprintln!("[DEBUG] Audio callback #{}, received {} samples", count, data.len());
-                    }
-                    drop(count);
-
                     let mut buffer = audio_buffer_clone.lock().unwrap();
                     if channels == 1 {
                         buffer.extend(data.iter().map(|&s| ((s as f32 - 32768.0) / 32768.0) * gain));
@@ -642,7 +686,9 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
     };
 
     stream.play()?;
-    eprintln!("[DEBUG] Audio stream started");
+    if debug {
+        eprintln!("[DEBUG] Audio stream started");
+    }
 
     // Process audio chunks and send them for inference
     let mut send_count = 0u64;
@@ -653,7 +699,9 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        let (chunk, buffer_size) = {
+        // CRITICAL: Keep mutex lock duration minimal to avoid blocking audio callbacks
+        // All logging happens AFTER releasing the lock
+        let (chunk, buffer_size, should_log) = {
             let mut buffer = audio_buffer.lock().unwrap();
             let current_size = buffer.len();
 
@@ -661,38 +709,44 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
                 max_buffer_size = current_size;
             }
 
-            // Log buffer status periodically
-            if last_buffer_check.elapsed() >= Duration::from_secs(5) {
-                let buffer_duration_ms = (current_size as f32 / 24000.0) * 1000.0;
-                let max_duration_ms = (max_buffer_size as f32 / 24000.0) * 1000.0;
+            let should_log = last_buffer_check.elapsed() >= Duration::from_secs(5);
 
-                eprintln!("[DEBUG] Audio buffer status: current={} samples ({:.1}ms), max={} samples ({:.1}ms)",
-                         current_size, buffer_duration_ms, max_buffer_size, max_duration_ms);
-
-                // Detect buffer growth trend
-                if current_size > prev_buffer_size + input_chunk_size {
-                    eprintln!("[WARNING] Buffer is GROWING! Was {} samples, now {} samples (+{} samples)",
-                             prev_buffer_size, current_size, current_size - prev_buffer_size);
-                    eprintln!("[WARNING] This means audio is arriving faster than inference can process it!");
-                    eprintln!("[WARNING] Transcription will lag behind real-time by {:.1}ms and growing", buffer_duration_ms);
-                }
-
-                // Alert if buffer is getting very large
-                if buffer_duration_ms > 1000.0 {
-                    eprintln!("[WARNING] Buffer contains over 1 second of audio! Processing is falling behind.");
-                }
-
-                prev_buffer_size = current_size;
-                last_buffer_check = Instant::now();
-            }
-
-            if buffer.len() >= input_chunk_size {
-                let chunk: Vec<f32> = buffer.drain(..input_chunk_size).collect();
-                (Some(chunk), current_size)
+            let chunk = if buffer.len() >= input_chunk_size {
+                Some(buffer.drain(..input_chunk_size).collect::<Vec<f32>>())
             } else {
-                (None, current_size)
-            }
+                None
+            };
+
+            (chunk, current_size, should_log)
+            // Lock is released here
         };
+
+        // Log buffer status OUTSIDE the mutex lock to prevent blocking audio callbacks
+        if should_log {
+            let buffer_duration_ms = (buffer_size as f32 / 24000.0) * 1000.0;
+
+            if debug {
+                let max_duration_ms = (max_buffer_size as f32 / 24000.0) * 1000.0;
+                eprintln!("[DEBUG] Audio buffer status: current={} samples ({:.1}ms), max={} samples ({:.1}ms)",
+                         buffer_size, buffer_duration_ms, max_buffer_size, max_duration_ms);
+            }
+
+            // Detect buffer growth trend (always warn, not debug)
+            if buffer_size > prev_buffer_size + input_chunk_size {
+                eprintln!("[WARNING] Buffer is GROWING! Was {} samples, now {} samples (+{} samples)",
+                         prev_buffer_size, buffer_size, buffer_size - prev_buffer_size);
+                eprintln!("[WARNING] This means audio is arriving faster than inference can process it!");
+                eprintln!("[WARNING] Transcription will lag behind real-time by {:.1}ms and growing", buffer_duration_ms);
+            }
+
+            // Alert if buffer is getting very large (always warn)
+            if buffer_duration_ms > 1000.0 {
+                eprintln!("[WARNING] Buffer contains over 1 second of audio! Processing is falling behind.");
+            }
+
+            prev_buffer_size = buffer_size;
+            last_buffer_check = Instant::now();
+        }
 
         let chunk = match chunk {
             Some(c) => c,
@@ -700,15 +754,18 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
         };
 
         send_count += 1;
-        eprintln!("[DEBUG] Sending chunk #{} to inference (buffer had {} samples)",
-                 send_count, buffer_size);
+        let current_pending = pending_chunks.load(Ordering::Relaxed);
+        if debug {
+            eprintln!("[DEBUG] Sending chunk #{} to inference (buffer had {} samples, {} chunks pending in channel)",
+                     send_count, buffer_size, current_pending);
+        }
 
         // Resample if needed
-        let resample_start = Instant::now();
         let chunk = if needs_resampling {
+            let resample_start = Instant::now();
             let resampled = kaudio::resample(&chunk, sample_rate as usize, 24000)?;
             let resample_duration = resample_start.elapsed();
-            if resample_duration > Duration::from_millis(10) {
+            if debug && resample_duration > Duration::from_millis(10) {
                 eprintln!("[DEBUG] Resampling took: {:?}", resample_duration);
             }
             resampled
@@ -716,20 +773,43 @@ fn stream_from_microphone(sender: Sender<Vec<f32>>, gain: f32) -> Result<()> {
             chunk
         };
 
-        // Send chunk for processing
-        let send_start = Instant::now();
-        if sender.send(chunk).is_err() {
-            eprintln!("[DEBUG] Receiver dropped, stopping microphone stream");
-            break; // Receiver dropped, stop streaming
+        // Load shedding: if too many chunks pending (>25 = 2 seconds of audio), drop this chunk
+        const MAX_PENDING_CHUNKS: u64 = 25;
+        if current_pending > MAX_PENDING_CHUNKS {
+            eprintln!("[WARNING] LOAD SHEDDING: Dropping chunk #{} - {} chunks pending (>{} threshold)",
+                     send_count, current_pending, MAX_PENDING_CHUNKS);
+            eprintln!("[WARNING] Inference is falling behind by ~{:.1}s", current_pending as f32 * 0.08);
+            continue; // Skip this chunk to let inference catch up
         }
-        let send_duration = send_start.elapsed();
 
-        if send_duration > Duration::from_millis(50) {
-            eprintln!("[WARNING] Channel send blocked for: {:?}", send_duration);
+        // Send chunk for processing using try_send to detect backpressure
+        match sender.try_send(chunk) {
+            Ok(()) => {
+                pending_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Full(chunk)) => {
+                // Channel is full - block and send (this provides backpressure)
+                eprintln!("[WARNING] Channel full, blocking send for chunk #{}", send_count);
+                if sender.send(chunk).is_err() {
+                    if debug {
+                        eprintln!("[DEBUG] Receiver dropped, stopping microphone stream");
+                    }
+                    break;
+                }
+                pending_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                if debug {
+                    eprintln!("[DEBUG] Receiver dropped, stopping microphone stream");
+                }
+                break;
+            }
         }
     }
 
-    eprintln!("[DEBUG] Microphone streaming stopped. Total chunks sent: {}", send_count);
+    if debug {
+        eprintln!("[DEBUG] Microphone streaming stopped. Total chunks sent: {}", send_count);
+    }
     Ok(())
 }
 
@@ -875,18 +955,25 @@ fn main() -> Result<()> {
             model.run(pcm, args.output)?;
         } else {
             // For continuous recording, use streaming mode
-            let (sender, receiver) = mpsc::channel();
+            // Use bounded channel (capacity 50 = ~4 seconds of audio) for backpressure
+            const CHANNEL_CAPACITY: usize = 50;
+            let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
             let gain = args.gain;
+            let debug = args.debug;
+
+            // Shared counter for pending chunks (for monitoring and load shedding)
+            let pending_chunks = Arc::new(AtomicU64::new(0));
+            let pending_chunks_sender = pending_chunks.clone();
 
             // Spawn microphone capture thread
             std::thread::spawn(move || {
-                if let Err(e) = stream_from_microphone(sender, gain) {
+                if let Err(e) = stream_from_microphone(sender, pending_chunks_sender, gain, debug) {
                     eprintln!("Microphone error: {}", e);
                 }
             });
 
             // Run streaming inference on main thread
-            model.run_streaming(receiver, args.output)?;
+            model.run_streaming(receiver, pending_chunks, args.output, debug)?;
         }
     } else {
         // File input - use batch mode
