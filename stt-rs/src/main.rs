@@ -110,6 +110,10 @@ struct Args {
     #[arg(long)]
     list_devices: bool,
 
+    /// Select audio input device by index (from --list-devices output).
+    #[arg(long)]
+    device: Option<usize>,
+
     /// Duration in seconds to record from microphone (default: continuous until Ctrl+C).
     #[arg(long)]
     duration: Option<f32>,
@@ -585,13 +589,19 @@ fn list_audio_devices() -> Result<()> {
     Ok(())
 }
 
-fn stream_from_microphone(sender: SyncSender<Vec<f32>>, pending_chunks: Arc<AtomicU64>, gain: f32, debug: bool) -> Result<()> {
+fn stream_from_microphone(sender: SyncSender<Vec<f32>>, pending_chunks: Arc<AtomicU64>, gain: f32, device_id: Option<usize>, debug: bool) -> Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::SampleFormat;
 
     let host = cpal::default_host();
-    let device = host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+    let device = if let Some(idx) = device_id {
+        host.input_devices()?
+            .nth(idx)
+            .ok_or_else(|| anyhow::anyhow!("No input device at index {}", idx))?
+    } else {
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No default input device available"))?
+    };
 
     println!("Using input device: {}", device.name()?);
 
@@ -813,13 +823,19 @@ fn stream_from_microphone(sender: SyncSender<Vec<f32>>, pending_chunks: Arc<Atom
     Ok(())
 }
 
-fn capture_from_microphone(duration: Option<f32>, gain: f32) -> Result<Vec<f32>> {
+fn capture_from_microphone(duration: Option<f32>, gain: f32, device_id: Option<usize>) -> Result<Vec<f32>> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::SampleFormat;
 
     let host = cpal::default_host();
-    let device = host.default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+    let device = if let Some(idx) = device_id {
+        host.input_devices()?
+            .nth(idx)
+            .ok_or_else(|| anyhow::anyhow!("No input device at index {}", idx))?
+    } else {
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No default input device available"))?
+    };
 
     println!("Using input device: {}", device.name()?);
 
@@ -947,7 +963,7 @@ fn main() -> Result<()> {
         // Use streaming mode for microphone input
         if args.duration.is_some() {
             // For fixed duration, use batch mode
-            let pcm = capture_from_microphone(args.duration, args.gain)?;
+            let pcm = capture_from_microphone(args.duration, args.gain, args.device)?;
             println!("Running inference");
             if let Some(ref path) = args.output {
                 println!("Transcript will be appended to: {}", path);
@@ -960,6 +976,7 @@ fn main() -> Result<()> {
             let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
             let gain = args.gain;
             let debug = args.debug;
+            let device_id = args.device;
 
             // Shared counter for pending chunks (for monitoring and load shedding)
             let pending_chunks = Arc::new(AtomicU64::new(0));
@@ -967,7 +984,7 @@ fn main() -> Result<()> {
 
             // Spawn microphone capture thread
             std::thread::spawn(move || {
-                if let Err(e) = stream_from_microphone(sender, pending_chunks_sender, gain, debug) {
+                if let Err(e) = stream_from_microphone(sender, pending_chunks_sender, gain, device_id, debug) {
                     eprintln!("Microphone error: {}", e);
                 }
             });
